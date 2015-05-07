@@ -7,20 +7,17 @@
 
 int main(int argc, char *argv[])
 {
-	int jacobi(unsigned long long int d, unsigned long long int n);
-	int lucasPrime (unsigned long long int n, unsigned long long int d);
+	int jacobi(signed long long int d, signed long long int n);
+	int lucasPrime (signed long long int n, signed long long int d);
 
-	unsigned long long int d, n, p, dAbs, sign;
+	signed long long int d, n, p, dAbs, sign;
 	int result;
 	
-	
-
-	n = 117;
-	d = 5;
+	result = 0;
+	n = 113;
 	dAbs = 5;
 	sign = 1;
-	result = 0;
-/*
+
 	while (result != -1)
 	{
 		d = dAbs*sign;	
@@ -28,21 +25,21 @@ int main(int argc, char *argv[])
 		dAbs = dAbs + 2;
 		sign = sign * -1;
 	}
-*/
-//	printf("d %lld, n %lld, result %d \n",d,n,result);
+
 	result = lucasPrime(d,n);
 	printf("d %lld, n %lld, result %d \n",d,n,result);
 	
 }
 
 
-int jacobi(unsigned long long int d, unsigned long long int n)
+int jacobi(signed long long int d, signed long long int n)
 {
 
 int t = 1;
-unsigned long long int temp;
+signed long long int temp;
 
 d = d % n;
+
 while (d != 0) 
 {
     while (d % 2 == 0)        //while d is even 
@@ -60,27 +57,25 @@ if (n == 1) return t;
 return 0;
 }
 
-int lucasPrime (unsigned long long int d, unsigned long long int n)
+int lucasPrime (signed long long int d, signed long long int n)
 {   
 	int p, i, length,k;
-	unsigned long long int q, q2, u, u2, uold, v, v2, t;
+	signed long long int q, q2, u, u2, uold, v, v2, t;
 
 //	if (gcd(d,n) != 1)
 //		return (0);
 
 	p = 1;
-	q = (1 - d)/4;
+	q = (1-d)/4;
 	u = 0;
 	v = 2;
 	u2 = 1;
-	v2 = p;
+	v2 = 1;
 	q2 = 2*q;
-
 	t = (n+1)/2;						//theta
-	length = sizeof(unsigned long long int)*8 - __builtin_clzll(t); //length of our number in bits. //clz(b00010010) = 3 	
-//	printf("length = %d\n", length);	
+	length = 64 - __builtin_clzll(t); //length of our number in bits. //clz(b00010010) = 3 	
 
-	for (i = 0; i < length-1; i++)
+	for (i = 0; i < length; i++)
 	{	
 		u2 = (u2 * v2) % n;
 		v2 = (v2 * v2 - q2) % n;
@@ -88,7 +83,8 @@ int lucasPrime (unsigned long long int d, unsigned long long int n)
 		{
 			uold = u;
 			u = (u2 * v) + (u * v2);
-			if (u % 2 == 1 ) u = u+n;
+			if (u % 2 == 1 )
+			 u = u+n;
 			u = (u / 2) % n;
 			v = (v2 * v) + (u2 * uold * d);
 			if (v % 2 == 1 ) v = v+n;  
@@ -99,7 +95,6 @@ int lucasPrime (unsigned long long int d, unsigned long long int n)
 		q2 = q + q;
 
 		t = t >> 1;
-		printf("u = %lld\n", u);	
 	}
 	return (u == 0);
 }
