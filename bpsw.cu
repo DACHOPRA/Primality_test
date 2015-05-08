@@ -16,77 +16,180 @@ inline void gpuAssert(cudaError_t code, char *file, int line, bool abort=true)
 	}
 }
 
-#define TILE_WIDTH 						64
+#define TILE_WIDTH 						128
 #define NUM_ELEMENTS					10240						//change this to change how many elements to process
 #define START_VAL						170101
 #define PRINT_TIME 						1
 
 
 
-void initializeArray1D(long long int *arr, int len, long long int start); 
-void initializeArrayConst(int *arr, int len);
-void initializeArraySPrimes(long long int *arr);
-int pruneArray(long long int *arrSrc, long long int *arrDest, int *result, int len);
+void initializeArray1D(long *arr, long len, long start); 
+void initializeArrayConst(int *arr, long len);
+void initializeArraySPrimes(long *arr);
+int pruneArray(long *arrSrc, long *arrDest, int *result, long len);
 
-__constant__ long long int d_sPrimes[256];							//declare constant array for small primes
+__constant__ long d_sPrimes[256];							//declare constant array for small primes
 
-__global__ void kernel_trialDiv (long long int* n, int* r) {
+__global__ void kernel_trialDiv (long* n, int* r) {
 	int bx = blockIdx.x;      // ID thread
 	int tx = threadIdx.x; 
-	int i;
-	
+	int i=0;
+
 	// Identify the row and column of the Pd element to work on
-	int memIndex = bx*TILE_WIDTH+tx;
+	long memIndex = bx*TILE_WIDTH+tx;
 	for (i = 0; i < 256; i++)
 	{
 //		r[memIndex] = ((n[memIndex])%(d_sPrimes[i]) == 0)? (r[memIndex] - 1) : r[memIndex];			//ternary is slower than if statement
 		if (n[memIndex] % d_sPrimes[i] == 0)
-			r[memIndex] = r[memIndex] - 1;
+			r[memIndex] = r[memIndex] - 1;															//r decreases from 1. Only 1s are prime candidates
 	}
-//	__syncthreads();
+
+	__syncthreads();
+}
+
+__global__ void kernel_jacobi(long* nArray, long* dArray, long len) {
+	int bx = blockIdx.x;      // ID thread
+	int tx = threadIdx.x;
+	int result, t;
+	long d, dAbs, sign, temp, n1, d1;
+	// Identify the row and column of the Pd element to work on
+	long memIndex = bx*TILE_WIDTH + tx;
+	if (memIndex < len)							//out of bounds checking - some threads will be doing nothing
+	{
+		result = 0;
+		dAbs = 5;
+		sign = 1;
+
+		while (result != -1)				//if result != -1, increment d and try again
+		{
+			n1 = nArray[memIndex];				//reinitialize n1 to n
+			d = dAbs*sign;
+			t = 1;
+			d1 = d;							//reinitialize d1 to d
+			d1 = d1 % n1;
+
+			while (d1 != 0)
+			{
+				while (d1 % 2 == 0)        //while d is even 
+				{
+					d1 = d1 / 2;
+					if (n1 % 8 == 3 || n1 % 8 == 5) t = -t;
+				}
+				temp = d1;
+				d1 = n1;
+				n1 = temp;
+				if ((d1 % 4 == 3) && (n1 % 4 == 3)) t = -t;
+				d1 = d1 % n1;
+			}
+			if (n1 == 1) result = t;
+			else result = 0;
+			dAbs = dAbs + 2;
+			sign = sign * -1;
+		}
+	}
+	__syncthreads();
+	if (memIndex < len)
+		dArray[memIndex] = d;
+	__syncthreads();
+}
+
+__global__ void kernel_lucas(long* nArray, long* dArray, int* rArray, long len) {
+	int bx = blockIdx.x;      // ID thread
+	int tx = threadIdx.x;
+	int i, length;
+	long long d, n;
+	long long q, q2, u, u2, uold, v, v2, t;
+
+	// Identify the row and column of the Pd element to work on
+	long memIndex = bx*TILE_WIDTH + tx;
+	if (memIndex < len)							//out of bounds checking - some threads will be doing nothing
+	{
+		d = (long long) dArray[memIndex];
+		n = (long long) nArray[memIndex];
+		q = (1 - d) / 4;
+		u = 0;
+		v = 2;
+		u2 = 1;
+		v2 = 1;
+		q2 = 2 * q;
+		t = (n + 1) / 2;						//theta
+		length = 32 - __clz(t); //length of our number in bits. //clz(b00010010) = 3 	
+
+		for (i = 0; i < length; i++)
+		{
+			u2 = (u2 * v2) % n;
+			v2 = (v2 * v2 - q2) % n;
+			if (t & 1)				//mask = 1
+			{
+				uold = u;
+				u = (u2 * v) + (u * v2);
+				u = (u % 2 == 1) ? u + n : u;
+				u = (u / 2) % n;
+				v = (v2 * v) + (u2 * uold * d);
+				v = (v % 2 == 1) ? v + n : v;
+				v = (v / 2) % n;
+			}
+
+			q = (q*q) % n;
+			q2 = q + q;
+
+			t = t >> 1;
+		}
+		
+	}
+	__syncthreads();
+	if (memIndex < len)
+		rArray[memIndex] = (u == 0);
+
 }
 
 int main(int argc, char **argv){
-	int arrLen = 0;
-//	int i;
-	long long int start = START_VAL;
+	int i, j;
+	long arrLen = 0;
+	long start = START_VAL;
 		
 	// GPU Timing variables
+	cudaEvent_t start_program, stop_program;
 	cudaEvent_t start_tDiv, stop_tDiv; 
 	cudaEvent_t start_memOp, stop_memOp;
+	cudaEvent_t start_jac, stop_jac;
+	cudaEvent_t start_luc, stop_luc;
+	
+
+
 	float elapsed_gpu;
 	
 	// Arrays on GPU global memory
-	long long int *d_n1, *d_n2;
-	int *d_r1, *d_r2;
+	long *d_n1, *d_n3, *d_d;
+	int *d_r1, *d_r3;
 
 	// Arrays on the host memory
-	long long int *h_n1, *h_n2;  
-	int *h_r1, *h_r2;
-//	long long int *h_sPrimes;	
+	long *h_n1, *h_n3, *h_n4;  
+	int *h_r1, *h_r3;
+//	long *h_sPrimes;	
 	
 	if (argc > 1) {
 		arrLen  = atoi(argv[1]);
 	}
 	else {
-		arrLen = NUM_ELEMENTS;										//arrLen = total number of elements to process
+		arrLen = NUM_ELEMENTS;											//arrLen = total number of elements to process
 	}
 	
-	int gridSize = arrLen / TILE_WIDTH;								//gridSize = number of blocks to use
-	printf("Length of the array = %d\n", arrLen);
+	long gridSize = arrLen / TILE_WIDTH;								//gridSize = number of blocks to use
+	printf("Number of numbers to check = %d\n", arrLen);
 
 	// Allocate GPU memory
-	int allocSizeLL = arrLen * sizeof(long long int);
-	int allocSizeInt = arrLen * sizeof(int);
-	int allocSizeSP = 256 * sizeof(long long int);
-	CUDA_SAFE_CALL(cudaMalloc((void **)&d_n1, allocSizeLL));
+	long allocSizeL = arrLen * sizeof(long);
+	long allocSizeInt = arrLen * sizeof(int);
+	long allocSizeSP = 256 * sizeof(long);
+	CUDA_SAFE_CALL(cudaMalloc((void **)&d_n1, allocSizeL));
 	CUDA_SAFE_CALL(cudaMalloc((void **)&d_r1, allocSizeInt));
 
 	
 	// Allocate arrays on host memory
-	h_n1 = (long long int *) malloc(allocSizeLL);
+	h_n1 = (long *) malloc(allocSizeL);
 	h_r1 = (int *) malloc(allocSizeInt);
-//	h_sPrimes = (long long int *) malloc(allocSizeSP);
+//	h_sPrimes = (long *) malloc(allocSizeSP);
 	
 
 	
@@ -94,7 +197,7 @@ int main(int argc, char **argv){
 	printf("\nInitializing the arrays ...");
 	initializeArray1D(h_n1, arrLen, start);
 	initializeArrayConst(h_r1, arrLen);
-	long long int h_sPrimes[256] =										//First 256 primes
+	long h_sPrimes[256] =										//First 256 primes
 	{						
 		2, 3, 5, 7, 11, 13, 17, 19, 23, 29,
 		31, 37, 41, 43, 47, 53, 59, 61, 67, 71,
@@ -126,6 +229,14 @@ int main(int argc, char **argv){
 
 	printf("\t... done\n\n");
 
+#if PRINT_TIME
+	// Create the cuda events for mem ops
+	cudaEventCreate(&start_program);
+	cudaEventCreate(&stop_program);
+	// Record event on the default stream
+	cudaEventRecord(start_program, 0);
+#endif
+
 
 #if PRINT_TIME
 	// Create the cuda events for mem ops
@@ -135,15 +246,17 @@ int main(int argc, char **argv){
 	cudaEventRecord(start_memOp, 0);
 #endif
 
-	// declare shape of block - 1x64 block, 64x64 grid
-	dim3 dimBlock(TILE_WIDTH,1);
-	dim3 dimGrid(gridSize,1);
+	// declare shape of block - 256x1 block, 64x1 grid
+	dim3 dimBlock1(TILE_WIDTH,1);
+	dim3 dimGrid1(gridSize,1);
 
 	// Transfer the arrays to the GPU memory
-	CUDA_SAFE_CALL(cudaMemcpy(d_n1, h_n1, allocSizeLL, cudaMemcpyHostToDevice));
+	CUDA_SAFE_CALL(cudaMemcpy(d_n1, h_n1, allocSizeL, cudaMemcpyHostToDevice));
 	CUDA_SAFE_CALL(cudaMemcpy(d_r1, h_r1, allocSizeInt, cudaMemcpyHostToDevice));
 	CUDA_SAFE_CALL(cudaMemcpyToSymbol(d_sPrimes, h_sPrimes, allocSizeSP));	
 
+
+	printf("\nPotential primes left = %ld\n", arrLen);
 
 #if PRINT_TIME
 	// Create the cuda events for trial division
@@ -155,15 +268,15 @@ int main(int argc, char **argv){
 
   	
 	// Launch the kernel
-	kernel_trialDiv<<<dimGrid, dimBlock>>>(d_n1, d_r1);
+	kernel_trialDiv<<<dimGrid1, dimBlock1>>>(d_n1, d_r1);
 
 	
 #if PRINT_TIME
-	// Stop and destroy the timer for MMM
+	// Stop and destroy the timer for trial division
 	cudaEventRecord(stop_tDiv,0);
 	cudaEventSynchronize(stop_tDiv);
 	cudaEventElapsedTime(&elapsed_gpu, start_tDiv, stop_tDiv);
-	printf("\nGPU time - kernel only: %f (msec)\n", elapsed_gpu);
+	printf("\nGPU time - trial division kernel only: %f (msec)\n", elapsed_gpu);
 	cudaEventDestroy(start_tDiv);
 	cudaEventDestroy(stop_tDiv);
 #endif
@@ -173,7 +286,7 @@ int main(int argc, char **argv){
 	CUDA_SAFE_CALL(cudaPeekAtLastError());
 	
 	// Transfer the results back to the host
-	CUDA_SAFE_CALL(cudaMemcpy(h_n1, d_n1, allocSizeLL, cudaMemcpyDeviceToHost));
+	CUDA_SAFE_CALL(cudaMemcpy(h_n1, d_n1, allocSizeL, cudaMemcpyDeviceToHost));
 	CUDA_SAFE_CALL(cudaMemcpy(h_r1, d_r1, allocSizeInt, cudaMemcpyDeviceToHost));
 	
 
@@ -191,15 +304,14 @@ int main(int argc, char **argv){
 	// Free-up device memory
 	CUDA_SAFE_CALL(cudaFree(d_n1));
 	CUDA_SAFE_CALL(cudaFree(d_r1));
-	
-	// Allocate memory for n2,r2 on host
-	h_n2 = (long long int *) malloc(allocSizeLL);
-	h_r2 = (int *) malloc(allocSizeInt);
-	
-	arrLen = pruneArray(h_n1,h_n2,h_r1,arrLen);						//copy h_n1 to h_n2, only potential primes. arrLen gets length of new array
-	
-	CUDA_SAFE_CALL(cudaMalloc((void **)&d_n2, allocSizeLL));
-	CUDA_SAFE_CALL(cudaMalloc((void **)&d_r2, allocSizeInt));	
+
+
+	// Allocate memory for n3,r3 on host
+	h_n3 = (long *) malloc(allocSizeL);
+	h_r3 = (int *) malloc(allocSizeInt);
+
+	arrLen = pruneArray(h_n1,h_n3,h_r1,arrLen);						//copy h_n1 to h_n3, only potential primes. arrLen gets length of new array
+	printf("\nPotential primes left = %ld\n", arrLen);
 
 	// Free-up host memory
 	free(h_n1);
@@ -207,27 +319,148 @@ int main(int argc, char **argv){
 
 // done with trial division	
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
-	
-//	printf("potential primes: \n");	
-//	for (i = 0; i < arrLen; i++)		
-//		printf("%lld\t",h_n2[i]);
+// calculate jacobi value for each n
 
 
-		
-	free(h_n2);
-	free(h_r2);	
-	CUDA_SAFE_CALL(cudaFree(d_n2));
-	CUDA_SAFE_CALL(cudaFree(d_r2));	
-		
+	gridSize = (arrLen / TILE_WIDTH) + (arrLen % TILE_WIDTH != 0);				//calculate new number of blocks. Might not be divisible by tile_width, so add 1
+
+	// declare shape of block - 1x64 block, 64x64 grid
+	dim3 dimBlock3(TILE_WIDTH, 1);
+	dim3 dimGrid3(gridSize, 1);
+
+#if PRINT_TIME
+	// Create the cuda events for mem ops
+	cudaEventCreate(&start_memOp);
+	cudaEventCreate(&stop_memOp);
+	// Record event on the default stream
+	cudaEventRecord(start_memOp, 0);
+#endif
+
+
+	CUDA_SAFE_CALL(cudaMalloc((void **)&d_n3, allocSizeL));
+	CUDA_SAFE_CALL(cudaMalloc((void **)&d_d, allocSizeL));
+	CUDA_SAFE_CALL(cudaMalloc((void **)&d_r3, allocSizeInt));
+
+	CUDA_SAFE_CALL(cudaMemcpy(d_n3, h_n3, allocSizeL, cudaMemcpyHostToDevice));
+
+#if PRINT_TIME
+	// Create the cuda events for jacobi
+	cudaEventCreate(&start_jac);
+	cudaEventCreate(&stop_jac);
+	// Record event on the default stream
+	cudaEventRecord(start_jac, 0);
+#endif
+
+
+	kernel_jacobi << <dimGrid3, dimBlock3 >> >(d_n3, d_d, arrLen);
+
+#if PRINT_TIME
+	// Stop and destroy the timer for jacobi
+	cudaEventRecord(stop_jac, 0);
+	cudaEventSynchronize(stop_jac);
+	cudaEventElapsedTime(&elapsed_gpu, start_jac, stop_jac);
+	printf("\nGPU time - jacobi kernel only: %f (msec)\n", elapsed_gpu);
+	cudaEventDestroy(start_jac);
+	cudaEventDestroy(stop_jac);
+#endif
+
+#if PRINT_TIME
+	// Stop and destroy the timer for memory operations
+	cudaEventRecord(stop_memOp, 0);
+	cudaEventSynchronize(stop_memOp);
+	cudaEventElapsedTime(&elapsed_gpu, start_memOp, stop_memOp);
+	printf("\nGPU time - including memory operations: %f (msec)\n", elapsed_gpu);
+	cudaEventDestroy(start_memOp);
+	cudaEventDestroy(stop_memOp);
+#endif
+
+	// Check for errors during launch
+	CUDA_SAFE_CALL(cudaPeekAtLastError());
+
+//done with calculating jacobi value
+////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
+//run lucas probable prime test
+
+#if PRINT_TIME
+	// Create the cuda events for mem ops
+	cudaEventCreate(&start_memOp);
+	cudaEventCreate(&stop_memOp);
+	// Record event on the default stream
+	cudaEventRecord(start_memOp, 0);
+#endif
+
+#if PRINT_TIME
+	// Create the cuda events for lucas
+	cudaEventCreate(&start_luc);
+	cudaEventCreate(&stop_luc);
+	// Record event on the default stream
+	cudaEventRecord(start_luc, 0);
+#endif
+
+	kernel_lucas << <dimGrid3, dimBlock3 >> >(d_n3, d_d, d_r3, arrLen);
+
+#if PRINT_TIME
+	// Stop and destroy the timer for lucas
+	cudaEventRecord(stop_luc, 0);
+	cudaEventSynchronize(stop_luc);
+	cudaEventElapsedTime(&elapsed_gpu, start_luc, stop_luc);
+	printf("\nGPU time - lucas kernel only: %f (msec)\n", elapsed_gpu);
+	cudaEventDestroy(start_luc);
+	cudaEventDestroy(stop_luc);
+#endif
+
+	// Check for errors during launch
+	CUDA_SAFE_CALL(cudaPeekAtLastError());
+	CUDA_SAFE_CALL(cudaMemcpy(h_r3, d_r3, allocSizeInt, cudaMemcpyDeviceToHost));
+
+#if PRINT_TIME
+	// Stop and destroy the timer for memory operations
+	cudaEventRecord(stop_memOp, 0);
+	cudaEventSynchronize(stop_memOp);
+	cudaEventElapsedTime(&elapsed_gpu, start_memOp, stop_memOp);
+	printf("\nGPU time - including memory operations: %f (msec)\n", elapsed_gpu);
+	cudaEventDestroy(start_memOp);
+	cudaEventDestroy(stop_memOp);
+#endif
+
+#if PRINT_TIME
+	// Stop and destroy the timer for program
+	cudaEventRecord(stop_program, 0);
+	cudaEventSynchronize(stop_program);
+	cudaEventElapsedTime(&elapsed_gpu, start_program, stop_program);
+	printf("\nGPU time - total time: %f (msec)\n", elapsed_gpu);
+	cudaEventDestroy(start_program);
+	cudaEventDestroy(stop_program);
+#endif
+
+	// Allocate memory for n4 on host
+	allocSizeL = arrLen * sizeof(long);
+	h_n4 = (long *)malloc(allocSizeL);
+
+	arrLen = pruneArray(h_n3, h_n4, h_r3, arrLen);						//copy h_n3 to h_n4, only primes. arrLen gets length of new array
+	printf("\nNumber of prime numbers = %ld\n", arrLen);
+	printf("\nFirst 100 primes detected: \n");
+	for (i = 0; i < 10; i++)
+	{
+		for (j = 0; j < 10; j++)
+			printf("%ld ", h_n4[10 * i + j]);
+		printf("\n");
+	}
+
+	free(h_n3);
+	free(h_r3);
+	CUDA_SAFE_CALL(cudaFree(d_n3));
+	CUDA_SAFE_CALL(cudaFree(d_r3));	
+	CUDA_SAFE_CALL(cudaFree(d_d));
 		
 	return 0;
 
 	
 }
 
-void initializeArray1D(long long int *arr, int len, long long int start) 		//each element increments by 2
+void initializeArray1D(long *arr, long len, long start) 		//each element increments by 2
 {
-	int i;
+	long i;
 	for (i = 0; i < len; i++)
 	{
 		arr[i] = start;
@@ -235,24 +468,24 @@ void initializeArray1D(long long int *arr, int len, long long int start) 		//eac
 	}
 }
 
-void initializeArrayConst(int *arr, int len)				//initialize result matrix to 2
+void initializeArrayConst(int *arr, long len)				//initialize result matrix to 2
 {
-	int i;
+	long i;
 	for (i = 0; i < len; i++)
 		arr[i] = 1;
 }
 
-int pruneArray(long long int *arrSrc, long long int *arrDest, int *result, int len)
+int pruneArray(long *arrSrc, long *arrDest, int *result, long len)
 {
-	int i;
-	int length = 0;					//length of new array
+	long i;
+	long index = 0;					//length of new array
 	for (i = 0; i < len; i++)
 	{
 		if (result[i] == 1)							//only keep potential primes
 		{
-			arrDest[length] = arrSrc[i];			//write to the new array with current value
-			length = length + 1;
+			arrDest[index] = arrSrc[i];			//write to the new array with current value
+			index = index + 1;
 		}	
 	}
-	return (length);
+	return (index);
 }
